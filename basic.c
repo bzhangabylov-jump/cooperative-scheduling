@@ -2,32 +2,46 @@
 #include <unistd.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
+#include <linux/futex.h>
+#include <limits.h>
+#include <stdlib.h>
+
+int futex_wait(volatile int *addr, int val) {
+    return syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
+}
+
+int futex_wake(volatile int *addr, int n) {
+    return syscall(SYS_futex, addr, FUTEX_WAKE, n, NULL, NULL, 0);
+}
 
 void consumer(volatile int *flag) {
+    int pid = getpid();
+    printf("I'm the consumer process with pid %d\n", pid);
     while (1) {
-        printf("I'm the consumer process\n");
+        // sleep if flag is 0 and wait for wake
+        futex_wait(flag, 0);
         if (*flag > 0) {
             *flag -= 1;
-            printf("Consumed a value, flag is now %d\n", *flag);
+            printf("Consumer %d: got work !!!! flag is %d\n", pid, *flag);
         }
-        sleep(1);
     }
 }
 
 void producer(volatile int *flag) {
     while (1) {
-        printf("I'm the producer process\n");
-        *flag = 1;
+        *flag += 1;
+        // wake up 1 consumer
+        futex_wake(flag, 1);
         printf("Produced a value, flag is now %d\n", *flag);
-        sleep(5);
+        sleep(1);
     }
 }
 
 int main() {
     volatile int *flag = mmap(NULL, sizeof(int), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     *flag = 0;
-    printf("flag has been defined %d\n", *flag);
-    printf("flag address is %p\n", (void *) flag);
+
     pid_t producer_pid, consumer_pid;
 
     producer_pid = fork();
@@ -41,8 +55,6 @@ int main() {
     if (consumer_pid == 0) {
         consumer(flag);
     }
-
-    printf("both children have been created\n");
 
     while(1) {
         pause(); // keep the application alive
