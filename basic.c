@@ -54,15 +54,16 @@ void consumerNFutexes(volatile int **futexes, int num_futexes) {
         seq_nums[i] = 1;
     }
 
+    // construct waiters
+    for (int i = 0; i < num_futexes; i++) {
+        waiters[i].uaddr = (uintptr_t) (futexes[i]);
+        waiters[i].val = seq_nums[i] - 1;
+        // waiters[i].flags = FUTEX2_SIZE_U64;
+        waiters[i].flags = FUTEX_32; // says do not use?
+        waiters[i].__reserved = 0;
+    }
+
     while (1) {
-        // construct waiters
-        for (int i = 0; i < num_futexes; i++) {
-            waiters[i].uaddr = (uintptr_t) (futexes[i]);
-            waiters[i].val = seq_nums[i] - 1;
-            // waiters[i].flags = FUTEX2_SIZE_U64;
-            waiters[i].flags = FUTEX_32; // says do not use?
-            waiters[i].__reserved = 0;
-        }
         // wait for any futex to be set to 1
         int ret = futex_waitv(waiters, num_futexes);
         if (ret >= 0) {
@@ -70,8 +71,9 @@ void consumerNFutexes(volatile int **futexes, int num_futexes) {
             int seq_num = seq_nums[ret];
             if (__sync_val_compare_and_swap(futex, seq_num, seq_num) == seq_num) {
                 printf("Consumer %d: got work from futexes[%d] !!!! futexes[%d] is %d\n", pid, ret, ret, *futex);
-                sleep(10);
+                // sleep(10);
                 seq_nums[ret] += 1;
+                waiters[ret].val = seq_nums[ret] - 1;
             }
         } else if (ret == -1 && errno == EAGAIN) {
             printf("One or more futexes are not the expected value, checking futex values...\n");
@@ -81,8 +83,9 @@ void consumerNFutexes(volatile int **futexes, int num_futexes) {
                 if (*futex == seq_num) { // there's a new frag
                     if (__sync_val_compare_and_swap(futex, seq_num, seq_num) == seq_num) {
                         printf("Consumer %d: got work from futexes[%d] !!!! futexes[%d] is %d\n", pid, i, i, *futex);
-                        sleep(20);
+                        // sleep(20);
                         seq_nums[i] += 1;
+                        waiters[i].val = seq_nums[i] - 1;
                     }
                 } else if (*futex > seq_num) {
                     printf("Consumer %d: futexes[%d] got overrun, consumer was looking for %d but got %d\n", pid, i, seq_num, *futex);
