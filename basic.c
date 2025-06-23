@@ -12,7 +12,7 @@
 #include <errno.h>
 
 int futex_wait(volatile int *addr, int val) {
-    // syscall(SYS_futex, uint32_t *uaddr, int futex_op, uint32_t val,
+    // syscall(SYS_futex, uint31_t *uaddr, int futex_op, uint32_t val,
     //                 const struct timespec *timeout,   /* or: uint32_t val2 */
     //                 uint32_t *uaddr2, uint32_t val3);
     return syscall(SYS_futex, addr, FUTEX_WAIT, val, NULL, NULL, 0);
@@ -22,8 +22,7 @@ int futex_wake(volatile int *addr, int n) {
     return syscall(SYS_futex, addr, FUTEX_WAKE, n, NULL, NULL, 0);
 }
 
-int futex_waitv(struct futex_waitv *waiters, unsigned int nr_futexes,
-                unsigned int flags) {
+int futex_waitv(struct futex_waitv *waiters, unsigned int nr_futexes) {
     // flags needs to be 0, timeout is 0, none
     // futex_waitv(struct futex_waitv *waiters, unsigned int nr_futexes,
             // unsigned int flags, struct timespec *timeout, clockid_t clockid)
@@ -49,31 +48,47 @@ void consumerNFutexes(volatile int **futexes, int num_futexes) {
     printf("I'm the consumer process with %d futexes and pid %d\n", num_futexes, pid);
 
     struct futex_waitv waiters[num_futexes];
+
+    int seq_nums[num_futexes];
     for (int i = 0; i < num_futexes; i++) {
-        waiters[i].uaddr = (uintptr_t) (futexes[i]);
-        waiters[i].val = 0;
-        // waiters[i].flags = FUTEX2_SIZE_U64;
-        waiters[i].flags = FUTEX_32; // says do not use?
-        waiters[i].__reserved = 0;
+        seq_nums[i] = 1;
     }
 
     while (1) {
+        // construct waiters
+        for (int i = 0; i < num_futexes; i++) {
+            waiters[i].uaddr = (uintptr_t) (futexes[i]);
+            waiters[i].val = seq_nums[i] - 1;
+            // waiters[i].flags = FUTEX2_SIZE_U64;
+            waiters[i].flags = FUTEX_32; // says do not use?
+            waiters[i].__reserved = 0;
+        }
         // wait for any futex to be set to 1
-        int ret = futex_waitv(waiters, num_futexes, 0);
+        int ret = futex_waitv(waiters, num_futexes);
         if (ret >= 0) {
             volatile int *futex = futexes[ret];
-            if (__sync_val_compare_and_swap(futex, 1, 0) == 1) {
+            int seq_num = seq_nums[ret];
+            if (__sync_val_compare_and_swap(futex, seq_num, seq_num) == seq_num) {
                 printf("Consumer %d: got work from futexes[%d] !!!! futexes[%d] is %d\n", pid, ret, ret, *futex);
+                sleep(10);
+                seq_nums[ret] += 1;
             }
         } else if (ret == -1 && errno == EAGAIN) {
-            printf("One or more futexes are non-zero, checking futex values...\n");
+            printf("One or more futexes are not the expected value, checking futex values...\n");
             for (int i = 0; i < num_futexes; i++) {
                 volatile int *futex = futexes[i];
-                if (*futex != 0) {
-                    if (__sync_val_compare_and_swap(futex, 1, 0) == 1) {
+                int seq_num = seq_nums[i];
+                if (*futex == seq_num) { // there's a new frag
+                    if (__sync_val_compare_and_swap(futex, seq_num, seq_num) == seq_num) {
                         printf("Consumer %d: got work from futexes[%d] !!!! futexes[%d] is %d\n", pid, i, i, *futex);
+                        sleep(20);
+                        seq_nums[i] += 1;
                     }
+                } else if (*futex > seq_num) {
+                    printf("Consumer %d: futexes[%d] got overrun, consumer was looking for %d but got %d\n", pid, i, seq_num, *futex);
+                    seq_nums[i] = *futex + 1;
                 }
+                printf("futexes[%d] = %d, seq_nums[%d] = %d\n", i, *futexes[i], i, seq_nums[i]);
             }
         } else {
             perror("futex_waitv failed some other way");
@@ -84,7 +99,8 @@ void consumerNFutexes(volatile int **futexes, int num_futexes) {
     }
 }
 
-void producer(volatile int *futex, int index) {
+void producer(volatile int *futex, int index, int duration) {
+    int seq_num = 1;
     while (1) {
 
         // FD_ATOMIC_ADD_AND_FETCH
@@ -93,12 +109,14 @@ void producer(volatile int *futex, int index) {
 
         // FD_ATOMIC_XCHG(p,v)  
         // *futex = 1;
-        __sync_lock_test_and_set( (futex), (1) );
+        sleep(duration);
+        
+        __sync_lock_test_and_set( (futex), (seq_num) );
+        printf("Produced a value, futex (index %d) is now %d\n", index, *futex);
+        seq_num++;
 
         // wake up ALL consumers
         futex_wake(futex, INT_MAX);
-        printf("Produced a value, futex (index %d) is now %d\n", index, *futex);
-        sleep(5);
     }
 }
 
@@ -110,7 +128,7 @@ void oneFutexCase() {
 
     producer_pid = fork();
     if (producer_pid == 0) {
-        producer(futex, 0);
+        producer(futex, 0, 5);
     }
 
     consumer_pid = fork();
@@ -126,7 +144,7 @@ void oneFutexCase() {
 }
 
 void nFutexCase() {
-    int num_futexes = 2;
+    int num_futexes = 3;
     volatile int *futexes[num_futexes];
 
     for (int i = 0; i < num_futexes; i++) {
@@ -137,11 +155,14 @@ void nFutexCase() {
         *futexes[i] = 0;
     }
 
+    int duration = 3;
+    int multiplier = 2;
     for (int i = 0; i < num_futexes; i++) {
         int producer_pid = fork();
         if (producer_pid == 0) {
-            producer(futexes[i], i);
+            producer(futexes[i], i, duration);
         }
+        duration *= multiplier;
     }
 
     int consumer_id = fork();
