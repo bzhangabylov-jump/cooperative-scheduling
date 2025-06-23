@@ -11,6 +11,9 @@
 #include <time.h>
 #include <errno.h>
 
+// link to fd_tango, and fd_util
+// #include <fd_mcache.h>
+
 int futex_wait(volatile int *addr, int val) {
     // syscall(SYS_futex, uint31_t *uaddr, int futex_op, uint32_t val,
     //                 const struct timespec *timeout,   /* or: uint32_t val2 */
@@ -67,29 +70,30 @@ void consumerNFutexes(volatile int **futexes, int num_futexes) {
         // wait for any futex to be set to 1
         int ret = futex_waitv(waiters, num_futexes);
         if (ret >= 0) {
-            volatile int *futex = futexes[ret];
-            int seq_num = seq_nums[ret];
-            if (__sync_val_compare_and_swap(futex, seq_num, seq_num) == seq_num) {
+            volatile int * futex = futexes[ret];
+            int futex_value = *futex;
+            // FD_COMPILER_MFENCE(); // DO NOT DELETE, NECESSARY
+            if( futex_value==seq_nums[ret] ) {
                 printf("Consumer %d: got work from futexes[%d] !!!! futexes[%d] is %d\n", pid, ret, ret, *futex);
-                // sleep(10);
+                sleep(5);
                 seq_nums[ret] += 1;
                 waiters[ret].val = seq_nums[ret] - 1;
             }
-        } else if (ret == -1 && errno == EAGAIN) {
+        } else if (ret == -1 && (errno == EAGAIN || errno == EINTR ) ) {
             printf("One or more futexes are not the expected value, checking futex values...\n");
             for (int i = 0; i < num_futexes; i++) {
                 volatile int *futex = futexes[i];
-                int seq_num = seq_nums[i];
-                if (*futex == seq_num) { // there's a new frag
-                    if (__sync_val_compare_and_swap(futex, seq_num, seq_num) == seq_num) {
-                        printf("Consumer %d: got work from futexes[%d] !!!! futexes[%d] is %d\n", pid, i, i, *futex);
-                        // sleep(20);
-                        seq_nums[i] += 1;
-                        waiters[i].val = seq_nums[i] - 1;
-                    }
-                } else if (*futex > seq_num) {
-                    printf("Consumer %d: futexes[%d] got overrun, consumer was looking for %d but got %d\n", pid, i, seq_num, *futex);
+                int futex_value = *futex;
+                // FD_COMPILER_MFENCE(); // DO NOT DELETE, NECESSARY
+                if (futex_value == seq_nums[i]) {
+                    printf("Consumer %d: got work from futexes[%d] !!!! futexes[%d] is %d\n", pid, i, i, *futex);
+                    sleep(5);
+                    seq_nums[i] += 1;
+                    waiters[i].val = seq_nums[i] - 1;
+                } else if (futex_value > seq_nums[i]) {
+                    printf("Consumer %d: futexes[%d] got overrun, consumer was looking for %d but got %d\n", pid, i, seq_nums[i], *futex);
                     seq_nums[i] = *futex + 1;
+                    waiters[i].val = seq_nums[i] - 1;
                 }
                 printf("futexes[%d] = %d, seq_nums[%d] = %d\n", i, *futexes[i], i, seq_nums[i]);
             }
@@ -158,7 +162,7 @@ void nFutexCase() {
         *futexes[i] = 0;
     }
 
-    int duration = 3;
+    int duration = 1;
     int multiplier = 2;
     for (int i = 0; i < num_futexes; i++) {
         int producer_pid = fork();
